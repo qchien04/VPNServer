@@ -1,0 +1,655 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <map>
+#include <memory>
+#include <random>
+#include <cstring>
+#include <stdexcept>
+#include <sstream>
+#include <iomanip>
+//g++ -std=c++14 -O2 -Wall -Wextra -o ikev2 ikev2.cpp -lssl -lcrypto
+#include "IKESA.h"
+#include "KEPayload.h"
+#include "IKEMessage.h"
+#include "SAPayload.h"
+#include "NoncePayload.h"
+#include "IdentityPayload.h"
+#include "AuthPayload.h"
+#include "TrafficSelectorPayload.h"
+
+// Complete IKEv2 Protocol Implementation
+class IKEv2Protocol {
+private:
+    std::unique_ptr<IKESA> sa;
+    std::unique_ptr<KEPayload> ke_payload;
+    bool is_initiator;
+    std::vector<uint8_t> ni, nr; // Nonces
+    std::vector<uint8_t> sa_init_request_data;
+    std::vector<uint8_t> sa_init_response_data;
+    std::string preshared_key;
+
+    uint32_t message_id_in;
+    uint32_t message_id_out;
+public:
+    IKEv2Protocol(bool initiator, const std::string& psk = "defaultpsk") : 
+        is_initiator(initiator), preshared_key(psk) {
+        sa = std::make_unique<IKESA>(initiator);
+    }
+
+    IKESA* getSa() { return sa.get(); }
+    KEPayload* getKePayload() { return ke_payload.get(); }
+
+    std::vector<uint8_t> getNi(){
+        return ni;
+    }
+    std::vector<uint8_t> getNr(){
+        return nr;
+    }
+    
+    // Create complete IKE_SA_INIT request (Initiator)
+    IKEMessage createSAInitRequest() {
+        IKEMessage msg(IKEMessageType::IKE_SA_INIT);
+        
+        // Set header
+        IKEHeader header;
+        header.initiator_spi = sa->getInitiatorSPI();
+        header.responder_spi = 0;
+        header.flags = INITIATOR_FLAG;
+        header.message_id = 0;
+        header.exchange_type = IKEMessageType::IKE_SA_INIT;
+        msg.setHeader(header);
+        
+        // Create and add SA payload
+        SAPayload sa_payload = SAPayload::createDefaultSA();
+        std::vector<uint8_t> sa_data = sa_payload.serialize();
+        msg.addPayload(PayloadType::SA, sa_data);
+        
+        // Create and add KE payload
+        ke_payload = std::make_unique<KEPayload>(DHGroup::MODP_2048);
+        std::vector<uint8_t> ke_data = ke_payload->serialize();
+        msg.addPayload(PayloadType::KE, ke_data);
+        
+        // Create and add Nonce payload
+        NoncePayload nonce_payload;
+        ni = nonce_payload.getNonce();
+        
+        std::vector<uint8_t> nonce_data = nonce_payload.serialize();
+        msg.addPayload(PayloadType::Ni, nonce_data);
+        
+        // Store for later AUTH calculation
+        sa_init_request_data = msg.serialize();
+        
+        return msg;
+    }
+
+    std::string bytesToHex(const std::vector<uint8_t>& data) {
+        std::ostringstream oss;
+        for (auto b : data) {
+            oss << std::hex << std::setw(2) << std::setfill('0') << (int)b;
+        }
+        return oss.str();
+    }
+
+    // Create IKE_SA_INIT response (Responder)
+    IKEMessage createSAInitResponse(const IKEMessage& request) {
+        // save info
+        uint64_t resp_spi;
+        sa->generateSPI(resp_spi);
+        sa->setResponderSPI(resp_spi);
+
+        sa->setInitiatorSPI(request.getHeader().initiator_spi);
+        ni = request.getPayloadFromMessage(PayloadType::Ni);
+        sa_init_request_data = request.serialize();
+
+        //main logic
+        IKEMessage msg(IKEMessageType::IKE_SA_INIT);
+        
+        // Set header
+        IKEHeader header;
+        header.initiator_spi = request.getHeader().initiator_spi;
+        header.exchange_type = IKEMessageType::IKE_SA_INIT;
+        header.responder_spi = sa->getResponderSPI();
+        header.flags = RESPONSE_FLAG;
+        header.message_id = 0;
+        msg.setHeader(header);
+        
+        // Add SA payload (same as request for simplicity)
+        SAPayload sa_payload = SAPayload::createDefaultSA();
+        std::vector<uint8_t> sa_data = sa_payload.serialize();
+        msg.addPayload(PayloadType::SA, sa_data);
+        
+        // Create and add KE payload
+        ke_payload = std::make_unique<KEPayload>(DHGroup::MODP_2048);
+        std::vector<uint8_t> ke_data = ke_payload->serialize();
+        msg.addPayload(PayloadType::KE, ke_data);
+        
+        // Create and add Nonce payload
+        NoncePayload nonce_payload;
+        nr = nonce_payload.getNonce();
+        std::vector<uint8_t> nonce_data = nonce_payload.serialize();
+        msg.addPayload(PayloadType::Nr, nonce_data);
+        
+        // Store for later AUTH calculation
+        sa_init_response_data = msg.serialize();
+
+
+
+        //-----------------------------------------------------------------------------------------------------------
+        try {
+            std::vector<uint8_t> ke_body = request.getPayloadFromMessage(PayloadType::KE);
+            KEPayload peer_ke = KEPayload::deserialize(ke_body);
+
+            
+            // Tính shared secret với peer key
+            std::vector<uint8_t> dh_shared_secret = ke_payload->computeSharedSecret(peer_ke.getPeerPublicKey());
+            ke_payload->setPeerKey(peer_ke.getPeerPublicKey());
+
+            sa->deriveKeys(dh_shared_secret, ni, nr);
+
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Error processing SA_INIT response: " << e.what() << std::endl;
+        }
+
+        sa_init_response_data = msg.serialize();
+
+        return msg;
+    }
+    
+    // Process IKE_SA_INIT response and derive keys (Initiator)
+    bool processSAInitResponse(const IKEMessage& response) {
+        sa_init_response_data=response.serialize();
+
+        sa->setResponderSPI(response.getHeader().responder_spi);
+        nr = response.getPayloadFromMessage(PayloadType::Nr);
+        try {
+            std::vector<uint8_t> ke_body = response.getPayloadFromMessage(PayloadType::KE);
+            KEPayload peer_ke = KEPayload::deserialize(ke_body);
+
+            ke_payload->setPeerKey(peer_ke.getPeerPublicKey());
+
+            // Tính shared secret với peer key
+            std::vector<uint8_t> dh_shared_secret = ke_payload->computeSharedSecret(peer_ke.getPeerPublicKey());
+
+            sa->deriveKeys(dh_shared_secret, ni, nr);
+
+            return true;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Error processing SA_INIT response: " << e.what() << std::endl;
+            return false;
+        }
+        return true;
+    }
+    
+    IKEMessage createAuthRequest() {
+        sa->createFirstChildSA();
+        IKEMessage msg(IKEMessageType::IKE_AUTH);
+
+        // Header
+        IKEHeader header;
+        header.initiator_spi = sa->getInitiatorSPI();
+        header.responder_spi = sa->getResponderSPI();
+        header.flags = INITIATOR_FLAG;
+        header.message_id = 1;
+        header.exchange_type = IKEMessageType::IKE_AUTH;
+        msg.setHeader(header);
+
+        // ---- Build inner payloads (IDi | AUTH | SA | TSi | TSr) ----
+        std::vector<uint8_t> inner_plain;
+
+        // 1) IDi (set next = AUTH)
+        std::string identity = "initiator@example.com";
+        std::vector<uint8_t> id_data(identity.begin(), identity.end());
+        IdentityPayload idi(IdentityPayload::ID_RFC822_ADDR, id_data);
+        std::vector<uint8_t> idi_serial = idi.serialize(/*next=*/PayloadType::AUTH);
+        inner_plain.insert(inner_plain.end(), idi_serial.begin(), idi_serial.end());
+
+        // 2) AUTH (calculate using PSK mode; AUTH is followed by SA)
+        std::vector<uint8_t> psk_vec(preshared_key.begin(), preshared_key.end());
+        // IMPORTANT: Auth requires the IKE_SA_INIT request+response octets.
+        // Use the concatenation of sa_init_request_data and sa_init_response_data (or an appropriate representation)
+        std::vector<uint8_t> sa_init_octets = sa_init_request_data;
+        sa_init_octets.insert(sa_init_octets.end(), sa_init_response_data.begin(), sa_init_response_data.end());
+
+        std::vector<uint8_t> auth_data = AuthPayload::calculatePSKAuth(
+            psk_vec, sa->getSK_pi(), idi_serial, sa_init_octets);
+        AuthPayload auth_payload(AuthPayload::SHARED_KEY_MESSAGE_INTEGRITY_CODE, auth_data);
+
+        
+        std::vector<uint8_t> auth_serial = auth_payload.serialize(PayloadType::SA);
+        inner_plain.insert(inner_plain.end(), auth_serial.begin(), auth_serial.end());
+
+        // 3) (Optional) Child SA proposal (if you don't want child SA now, skip this block)
+        SAPayload child_sa = SAPayload::createChildSAProposal(sa->getFirstChildSA()->getInboundSPI());
+        std::vector<uint8_t> child_sa_serial = child_sa.serialize(PayloadType::TSi);
+        // will point to TSi
+        inner_plain.insert(inner_plain.end(), child_sa_serial.begin(), child_sa_serial.end());
+
+        // 4) TSi
+        TrafficSelectorPayload tsi(true);
+        TrafficSelector ts_init;
+        ts_init.ts_type = 7; // TS_IPV4_ADDR_RANGE
+        ts_init.ip_protocol_id = 0;
+        ts_init.selector_length = 16;
+        ts_init.start_port = 100;
+        ts_init.end_port = 65535;
+        ts_init.starting_address = {192,168,1,1};
+        ts_init.ending_address  = {192,168,1,255};
+        tsi.addTrafficSelector(ts_init);
+        std::vector<uint8_t> tsi_serial = tsi.serialize();
+        if (!tsi_serial.empty()) tsi_serial[0] = static_cast<uint8_t>(PayloadType::TSr);
+        inner_plain.insert(inner_plain.end(), tsi_serial.begin(), tsi_serial.end());
+
+        // 5) TSr (last inner => NO_NEXT_PAYLOAD)
+        TrafficSelectorPayload tsr(false);
+        TrafficSelector ts_resp;
+        ts_resp.ts_type = 7;
+        ts_resp.ip_protocol_id = 0;
+        ts_resp.selector_length = 16;
+        ts_resp.start_port = 100;
+        ts_resp.end_port = 65535;
+        ts_resp.starting_address = {192,168,2,1};
+        ts_resp.ending_address  = {192,168,2,255};
+        tsr.addTrafficSelector(ts_resp);
+        std::vector<uint8_t> tsr_serial = tsr.serialize();
+        if (!tsr_serial.empty()) tsr_serial[0] = static_cast<uint8_t>(PayloadType::NO_NEXT_PAYLOAD);
+        inner_plain.insert(inner_plain.end(), tsr_serial.begin(), tsr_serial.end());
+        
+
+        // ---- Encrypt inner payloads into SK payload ----
+        std::vector<uint8_t> encrypted_inner = sa->encryptPayload(inner_plain); // returns IV || ciphertext
+        
+        // SK payload header: next_payload = first inner payload type (IDi)
+        PayloadHeader sk_ph;
+        sk_ph.next_payload = PayloadType::IDi;
+        sk_ph.critical_flag = 0;
+        sk_ph.payload_length = 4 + encrypted_inner.size();
+        std::vector<uint8_t> sk_payload = sk_ph.serialize();
+        sk_payload.insert(sk_payload.end(), encrypted_inner.begin(), encrypted_inner.end());
+
+        // Add SK to message
+        msg.addPayload(PayloadType::SK, sk_payload);
+            
+        return msg;
+    }
+
+    // Process AUTH request (Responder)  
+    IKEMessage createAuthResponse(const IKEMessage& request) {
+        IKEMessage msg(IKEMessageType::IKE_AUTH);
+
+        // Header
+        IKEHeader header;
+        header.initiator_spi = sa->getInitiatorSPI();
+        header.responder_spi = sa->getResponderSPI();
+        header.flags = RESPONSE_FLAG;
+        header.message_id = 1;
+        header.exchange_type = IKEMessageType::IKE_AUTH;
+        msg.setHeader(header);
+
+        std::vector<uint8_t> inner_plain;
+
+        // 1) IDr (Responder identity, next=AUTH)
+        std::string responder_identity = "responder@example.com";
+        std::vector<uint8_t> idr_data(responder_identity.begin(), responder_identity.end());
+        IdentityPayload idr(IdentityPayload::ID_RFC822_ADDR, idr_data);
+        std::vector<uint8_t> idr_serial = idr.serialize(PayloadType::AUTH);
+        inner_plain.insert(inner_plain.end(), idr_serial.begin(), idr_serial.end());
+
+        // 2) AUTH (Responder auth, next=SA)
+        std::vector<uint8_t> psk_vec(preshared_key.begin(), preshared_key.end());
+        std::vector<uint8_t> sa_init_octets = sa_init_request_data;
+        sa_init_octets.insert(sa_init_octets.end(), sa_init_response_data.begin(), sa_init_response_data.end());
+
+        std::vector<uint8_t> auth_data = AuthPayload::calculatePSKAuth(
+            psk_vec, sa->getSK_pr(), idr_serial, sa_init_octets);
+        AuthPayload auth_payload(AuthPayload::SHARED_KEY_MESSAGE_INTEGRITY_CODE, auth_data);
+        std::vector<uint8_t> auth_serial = auth_payload.serialize(PayloadType::SA);
+        inner_plain.insert(inner_plain.end(), auth_serial.begin(), auth_serial.end());
+
+        // 3) SA (Responder’s chosen Child SA, next=TSi)
+        SAPayload chosen_sa = SAPayload::createChildSAProposal(sa->getFirstChildSA()->getInboundSPI());
+        std::vector<uint8_t> sa_serial = chosen_sa.serialize();
+        if (!sa_serial.empty()) sa_serial[0] = static_cast<uint8_t>(PayloadType::TSi);
+        inner_plain.insert(inner_plain.end(), sa_serial.begin(), sa_serial.end());
+
+        // 4) TSi (next=TSr)
+        TrafficSelectorPayload tsi(true);
+        TrafficSelector ts_init;
+        ts_init.ts_type = 7; // TS_IPV4_ADDR_RANGE
+        ts_init.ip_protocol_id = 0;
+        ts_init.selector_length = 16;
+        ts_init.start_port = 0;
+        ts_init.end_port = 65535;
+        ts_init.starting_address = {192,168,1,1};
+        ts_init.ending_address  = {192,168,1,255};
+        tsi.addTrafficSelector(ts_init);
+        std::vector<uint8_t> tsi_serial = tsi.serialize();
+        if (!tsi_serial.empty()) tsi_serial[0] = static_cast<uint8_t>(PayloadType::TSr);
+        inner_plain.insert(inner_plain.end(), tsi_serial.begin(), tsi_serial.end());
+
+        // 5) TSr (last → NO_NEXT_PAYLOAD)
+        TrafficSelectorPayload tsr(false);
+        TrafficSelector ts_resp;
+        ts_resp.ts_type = 7;
+        ts_resp.ip_protocol_id = 0;
+        ts_resp.selector_length = 16;
+        ts_resp.start_port = 0;
+        ts_resp.end_port = 65535;
+        ts_resp.starting_address = {192,168,2,1};
+        ts_resp.ending_address  = {192,168,2,255};
+        tsr.addTrafficSelector(ts_resp);
+        std::vector<uint8_t> tsr_serial = tsr.serialize();
+        if (!tsr_serial.empty()) tsr_serial[0] = static_cast<uint8_t>(PayloadType::NO_NEXT_PAYLOAD);
+        inner_plain.insert(inner_plain.end(), tsr_serial.begin(), tsr_serial.end());
+        //std::cout<<"before enc: "<<bytesToHex(inner_plain)<<std::endl;
+        // Encrypt into SK payload
+        std::vector<uint8_t> encrypted_inner = sa->encryptPayload(inner_plain);
+        
+        //std::cout<<"affter enc: "<<bytesToHex(encrypted_inner)<<std::endl;
+        PayloadHeader sk_ph;
+        sk_ph.next_payload = PayloadType::IDr;
+        sk_ph.payload_length = 4 + encrypted_inner.size();
+        std::vector<uint8_t> sk_payload = sk_ph.serialize();
+        sk_payload.insert(sk_payload.end(), encrypted_inner.begin(), encrypted_inner.end());
+
+        msg.addPayload(PayloadType::SK, sk_payload);
+
+
+        return msg;
+    }
+
+    void printSAInfo() const {
+        std::cout << "=== IKE SA Information ===\n";
+        std::cout << "Role: " << (is_initiator ? "Initiator" : "Responder") << "\n";
+        std::cout << "Initiator SPI: 0x" << std::hex << sa->getInitiatorSPI() << std::dec << "\n";
+        std::cout << "Responder SPI: 0x" << std::hex << sa->getResponderSPI() << std::dec << "\n";
+        std::cout << "Preshared Key: " << preshared_key << "\n";
+        
+        if (!sa->getSK_ei().empty()) {
+            std::cout << "\n=== Derived Keys ===\n";
+            std::cout << "SK_d  (key derivation): " << sa->getSK_d().size() << " bytes\n";
+            std::cout << "SK_ai (integrity-initiator): " << sa->getSK_ai().size() << " bytes\n";
+            std::cout << "SK_ar (integrity-responder): " << sa->getSK_ar().size() << " bytes\n";
+            std::cout << "SK_ei (encryption-initiator): " << sa->getSK_ei().size() << " bytes\n";
+            std::cout << "SK_er (encryption-responder): " << sa->getSK_er().size() << " bytes\n";
+            std::cout << "SK_pi (auth-initiator): " << sa->getSK_pi().size() << " bytes\n";
+            std::cout << "SK_pr (auth-responder): " << sa->getSK_pr().size() << " bytes\n";
+        } else {
+            std::cout << "\nKeys not yet derived\n";
+        }
+        std::cout << "==========================\n\n";
+    }
+
+    void parseAuthRequestRaw(IKEMessage request) {
+        sa->createFirstChildSA();
+        IKEMessage msg(IKEMessageType::IKE_AUTH);
+        size_t offset = 0;
+
+        // 4. Decrypt SK
+        //std::cout << "-----------------------------------------------------------------------------------------------" << std::endl;
+        std::vector<uint8_t> payload_data = request.getPayloadFromMessage(PayloadType::SK);
+        //std::cout << "- before decype on responder           : 0x" << bytesToHex(payload_data) << "\n";
+        std::vector<uint8_t> decrypted_inner = sa->decryptPayload(payload_data);
+        //std::cout << "- affter decype on responder           : 0x" << bytesToHex(decrypted_inner) << "\n";
+
+        // 5. Parse inner payloads
+        size_t inner_off = 0;
+        PayloadHeader inner_hdr;
+
+        // AUTH
+        // inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
+        // AuthPayload auth = AuthPayload::deserialize(decrypted_inner, inner_off);
+        // bool ok = auth.verify(psk, sa->getSK_pr(), idi.serialize(), sa_init_request_data, sa_init_response_data);
+        // if (!ok) throw std::runtime_error("AUTH failed");
+
+        // === IDi ===
+        IdentityPayload idi = IdentityPayload::deserialize(decrypted_inner, inner_off);
+        std::cout << "[Responder] Got IDi payload" << std::endl;
+        //idi.debugPrint(); // gợi ý: tự viết hàm debug để in IDType + id_data
+
+        inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
+        inner_off += inner_hdr.payload_length;
+
+        // === AUTH ===
+        if (inner_hdr.next_payload == PayloadType::AUTH) {
+            AuthPayload auth = AuthPayload::deserialize(decrypted_inner, inner_off);
+            std::cout << "[Responder] Got AUTH payload" << std::endl;
+            //auth.debugPrint(); // in method + độ dài auth_data
+            inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
+            inner_off += inner_hdr.payload_length;
+        }
+
+        // === SA ===
+        if (inner_hdr.next_payload == PayloadType::SA) {
+            SAPayload sa_payload = SAPayload::deserialize(decrypted_inner, inner_off);
+            //std::cout << "----Spre Child SA payload" << std::hex << bytesToHex(sa_payload.getProposals()[0].spi) << "\n";
+            sa->getFirstChildSA()->setSpiOutbound(net_to_host32(*reinterpret_cast<const uint32_t*>(sa_payload.getProposals()[0].spi.data())));
+            // std::cout << "[Responder] Got Child SA payload" << *reinterpret_cast<const uint32_t*>(sa_payload.getProposals()[0].spi.data()) << std::endl;
+            // std::cout << "[Responder] Got Child SA payload" << sa->getFirstChildSA()->getOutboundSPI() << std::endl;
+            // std::cout << "[Responder] pre Child SA payload"<<bytesToHex(sa_payload.getProposals()[0].spi) << std::endl;
+            std::cout << "[Responder] Got Child SA payload" << std::endl;
+            sa_payload.debugPrint();
+            inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
+            inner_off += inner_hdr.payload_length;
+        }
+
+        // === TSi ===
+        
+        if (inner_hdr.next_payload == PayloadType::TSi) {
+            TrafficSelectorPayload tsi = TrafficSelectorPayload::deserialize(decrypted_inner, inner_off, true);
+            std::cout << "[Responder] Got TSi payload" << std::endl;
+            //tsi.debugPrint();
+            inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
+            inner_off += inner_hdr.payload_length;
+            std::vector<TrafficSelector> v1= TrafficSelectorPayload::toListTrafficSelector(tsi);
+            sa->getFirstChildSA()->setTrafficSelectorsI(v1);
+        }
+
+        // === TSr ===
+        if (inner_hdr.next_payload == PayloadType::TSr) {
+            TrafficSelectorPayload tsr = TrafficSelectorPayload::deserialize(decrypted_inner, inner_off, false);
+            std::cout << "[Responder] Got TSr payload" << std::endl;
+            //tsr.debugPrint();
+            inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
+            inner_off += inner_hdr.payload_length;
+            std::vector<TrafficSelector> v2= TrafficSelectorPayload::toListTrafficSelector(tsr);
+            sa->getFirstChildSA()->setTrafficSelectorsR(v2);
+        }
+        
+        std::cout << "Finished parsing IKE_AUTH request." << std::endl;
+
+        std::cout<<"--------------------------------------------------------------------------\n";
+
+        std::cout<<sa->getFirstChildSA()->toString();
+
+    }
+
+    void parseAuthReSponseRaw(IKEMessage request) {
+        IKEMessage msg(IKEMessageType::IKE_AUTH);
+        size_t offset = 0;
+        
+        // 4. Decrypt SK
+        //std::cout << "-----------------------------------------------------------------------------------------------" << std::endl;
+        std::vector<uint8_t> payload_data = request.getPayloadFromMessage(PayloadType::SK);
+        //std::cout << "- before decype on responder           : 0x" << bytesToHex(payload_data) << "\n";
+        std::vector<uint8_t> decrypted_inner = sa->decryptPayload(payload_data);
+        //std::cout << "- affter decype on responder           : 0x" << bytesToHex(decrypted_inner) << "\n";
+
+        // 5. Parse inner payloads
+        size_t inner_off = 0;
+        PayloadHeader inner_hdr;
+
+        // AUTH
+        // inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
+        // AuthPayload auth = AuthPayload::deserialize(decrypted_inner, inner_off);
+        // bool ok = auth.verify(psk, sa->getSK_pr(), idi.serialize(), sa_init_request_data, sa_init_response_data);
+        // if (!ok) throw std::runtime_error("AUTH failed");
+
+        // === IDi ===
+        IdentityPayload idi = IdentityPayload::deserialize(decrypted_inner, inner_off);
+        std::cout << "[Responder] Got IDi payload" << std::endl;
+        //idi.debugPrint(); // gợi ý: tự viết hàm debug để in IDType + id_data
+
+        inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
+        inner_off += inner_hdr.payload_length;
+
+        // === AUTH ===
+        if (inner_hdr.next_payload == PayloadType::AUTH) {
+            AuthPayload auth = AuthPayload::deserialize(decrypted_inner, inner_off);
+            std::cout << "[Responder] Got AUTH payload" << std::endl;
+            //auth.debugPrint(); // in method + độ dài auth_data
+            inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
+            inner_off += inner_hdr.payload_length;
+        }
+
+        // === SA ===
+        if (inner_hdr.next_payload == PayloadType::SA) {
+            SAPayload sa_payload = SAPayload::deserialize(decrypted_inner, inner_off);
+
+            sa->getFirstChildSA()->setSpiOutbound(net_to_host32(*reinterpret_cast<const uint32_t*>(sa_payload.getProposals()[0].spi.data())));
+            std::cout << "[Responder] Got Child SA payload" << std::endl;
+            sa_payload.debugPrint();
+            inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
+            inner_off += inner_hdr.payload_length;
+        }
+
+        // === TSi ===
+        
+        if (inner_hdr.next_payload == PayloadType::TSi) {
+            TrafficSelectorPayload tsi = TrafficSelectorPayload::deserialize(decrypted_inner, inner_off, true);
+            std::cout << "[Responder] Got TSi payload" << std::endl;
+            //tsi.debugPrint();
+            inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
+            inner_off += inner_hdr.payload_length;
+            std::vector<TrafficSelector> v1= TrafficSelectorPayload::toListTrafficSelector(tsi);
+            sa->getFirstChildSA()->setTrafficSelectorsI(v1);
+        }
+
+        // === TSr ===
+        if (inner_hdr.next_payload == PayloadType::TSr) {
+            TrafficSelectorPayload tsr = TrafficSelectorPayload::deserialize(decrypted_inner, inner_off, false);
+            std::cout << "[Responder] Got TSr payload" << std::endl;
+            //tsr.debugPrint();
+            inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
+            inner_off += inner_hdr.payload_length;
+            std::vector<TrafficSelector> v2= TrafficSelectorPayload::toListTrafficSelector(tsr);
+            sa->getFirstChildSA()->setTrafficSelectorsR(v2);
+        }
+        
+        std::cout << "Finished parsing IKE_AUTH request." << std::endl;
+
+        std::cout<<"--------------------------------------------------------------------------\n";
+
+        std::cout<<sa->getFirstChildSA()->toString();
+
+        
+
+    }
+};
+
+std::string bytesToHex(const std::vector<uint8_t>& data) {
+    std::ostringstream oss;
+    for (auto b : data) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << (int)b;
+    }
+    return oss.str();
+}
+// Example usage and comprehensive testing
+int main() {
+    std::cout << "Advanced IKEv2 Protocol Implementation\n";
+    std::cout << "=====================================\n";
+    
+    try {
+        // Initialize OpenSSL
+        OpenSSL_add_all_algorithms();
+        ERR_load_crypto_strings();
+        
+        // Test 1: Basic IKE exchange
+        std::cout << "\n=== TEST 1: Complete IKE Exchange ===\n";
+        IKEv2Protocol initiator(true, "MySecretPSK123");
+        IKEv2Protocol responder(false, "MySecretPSK123");
+        
+        std::cout << "\n=== Starting IKEv2 Exchange ===\n";
+            
+        // Step 1: IKE_SA_INIT exchange
+        std::cout << "Step 1: IKE_SA_INIT Request...\n";
+        IKEMessage sa_init_req = initiator.createSAInitRequest();
+        // std::cout << "- sa Initiator SPI: 0x" << std::hex << initiator.getSa()->getInitiatorSPI() << std::dec << "\n";
+        // std::cout << "- Generated SA_INIT request (" << sa_init_req.serialize().size() << " bytes)\n";
+        // std::cout << "- Initiator SPI: 0x" << std::hex << sa_init_req.getHeader().initiator_spi << std::dec << "\n";
+        
+        // Simulate responder
+        std::cout << "\nStep 2: IKE_SA_INIT Response...\n";
+        IKEMessage sa_init_resp = responder.createSAInitResponse(sa_init_req);
+        // std::cout << "- sa Initiator SPI on responder: 0x" << std::hex << responder.getSa()->getInitiatorSPI() << std::dec << "\n";
+        // std::cout << "- Initiator SPI: 0x" << std::hex << sa_init_resp.getHeader().initiator_spi << std::dec << "\n";
+        // std::cout << "- Generated SA_INIT response (" << sa_init_resp.serialize().size() << " bytes)\n";
+        // std::cout << "- Responder SPI: 0x" << std::hex << sa_init_resp.getHeader().responder_spi << std::dec << "\n";
+        
+        initiator.processSAInitResponse(sa_init_resp);
+        // std::cout<<"error6"<<std::endl;
+        // std::cout << "-----------------------------------------------------------------------------------------------" << std::endl;
+
+        // std::cout << "initiator-------------------------------"<<std::endl;
+        // std::cout << "- Initiator SPI on initiator: 0x" << std::hex << initiator.getSa()->getInitiatorSPI() << std::dec << "\n";
+        // std::cout << "- Responder SPI on initiator: 0x" << std::hex << initiator.getSa()->getResponderSPI() << std::dec << "\n";
+        // std::cout << "- publickey on initiator    : 0x" << std::hex << initiator.bytesToHex(initiator.getKePayload()->getPublicKey())<< "\n";
+        // std::cout << "- peerkey on initiator      : 0x" << std::hex << initiator.bytesToHex(initiator.getKePayload()->getPeerKey())<< "\n";
+        // std::cout << "- ni on initiator           : 0x" << initiator.bytesToHex(initiator.getNi()) << "\n";
+        // std::cout << "- nr on initiator           : 0x" << initiator.bytesToHex(initiator.getNr()) << "\n";
+        // std::cout << initiator.getSa()->toString() << std::endl;
+
+
+        // std::cout << "Responder-------------------------------"<<std::endl;
+        // std::cout << "- Initiator SPI on responder: 0x" << std::hex << responder.getSa()->getInitiatorSPI() << std::dec << "\n";
+        // std::cout << "- Responder SPI on responder: 0x" << std::hex << responder.getSa()->getResponderSPI() << std::dec << "\n";
+        // std::cout << "- publickey on responder    : 0x" << std::hex << responder.bytesToHex(responder.getKePayload()->getPublicKey())<< "\n";
+        // std::cout << "- peerkey on responder      : 0x" << std::hex << responder.bytesToHex(responder.getKePayload()->getPeerKey())<< "\n";
+        // std::cout << "- ni on responder           : 0x" << responder.bytesToHex(responder.getNi()) << "\n";
+        // std::cout << "- nr on responder           : 0x" << responder.bytesToHex(responder.getNr()) << "\n";
+        // std::cout << responder.getSa()->toString() << std::endl;
+        // std::cout<<"initiator sk_d "<<bytesToHex(initiator.getSa()->getSK_d())<<std::endl;
+        // std::cout<<"initiator sk_ai "<<bytesToHex(initiator.getSa()->getSK_ai())<<std::endl;
+        // std::cout<<"initiator sk_ar "<<bytesToHex(initiator.getSa()->getSK_ar())<<std::endl;
+        // std::cout<<"initiator sk_ei "<<bytesToHex(initiator.getSa()->getSK_ei())<<std::endl;
+        // std::cout<<"initiator sk_er "<<bytesToHex(initiator.getSa()->getSK_er())<<std::endl;
+        // std::cout<<"initiator sk_pi "<<bytesToHex(initiator.getSa()->getSK_pi())<<std::endl;
+        // std::cout<<"initiator sk_pr "<<bytesToHex(initiator.getSa()->getSK_pr())<<std::endl;
+        // std::cout << "-----------------------------------------------------------------------------------------------" << std::endl;
+        // std::cout<<"responder sk_d "<<bytesToHex(responder.getSa()->getSK_d())<<std::endl;
+        // std::cout<<"responder sk_ai "<<bytesToHex(responder.getSa()->getSK_ai())<<std::endl;
+        // std::cout<<"responder sk_ar "<<bytesToHex(responder.getSa()->getSK_ar())<<std::endl;
+        // std::cout<<"responder sk_ei "<<bytesToHex(responder.getSa()->getSK_ei())<<std::endl;
+        // std::cout<<"responder sk_er "<<bytesToHex(responder.getSa()->getSK_er())<<std::endl;
+        // std::cout<<"responder sk_pi "<<bytesToHex(responder.getSa()->getSK_pi())<<std::endl;
+        // std::cout<<"responder sk_pr "<<bytesToHex(responder.getSa()->getSK_pr())<<std::endl;
+
+
+
+        std::cout << "-----------------------------------------------------------------------------------------------" << std::endl;
+        std::cout << "-----------------------------------------------------------------------------------------------" << std::endl;
+        std::cout << "-----------------------------------------------------------------------------------------------" << std::endl;
+
+
+        IKEMessage rq = initiator.createAuthRequest();
+        responder.parseAuthRequestRaw(rq);
+        std::cout << "+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++" << std::endl;
+        IKEMessage rs = responder.createAuthResponse(rq);
+        initiator.parseAuthReSponseRaw(rs);
+
+        initiator.getSa()->getFirstChildSA()->deriveKeys(initiator.getSa()->getSK_d(),initiator.getNi(),initiator.getNr());
+        responder.getSa()->getFirstChildSA()->deriveKeys(responder.getSa()->getSK_d(),responder.getNi(),responder.getNr());
+        
+        std::cout << "****************************************************************************************" << std::endl;
+        std::cout <<initiator.getSa()->getFirstChildSA()->toString();
+        std::cout <<responder.getSa()->getFirstChildSA()->toString();
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << std::endl;
+        return 1;
+    }
+        
+    return 0;
+}
