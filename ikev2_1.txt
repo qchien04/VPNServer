@@ -19,7 +19,7 @@
 #include <fcntl.h>
 #include <poll.h>
 
-//g++ -std=c++14 -O2 -Wall -Wextra -o ikev2 ikev2.cpp -lssl -lcrypto -lpthread
+//g++ -std=c++14 -O2 -Wall -Wextra -o ikev2_network ikev2_network.cpp -lssl -lcrypto -lpthread
 
 #include "IKESA.h"
 #include "KEPayload.h"
@@ -583,7 +583,7 @@ private:
         inner_plain.insert(inner_plain.end(), auth_serial.begin(), auth_serial.end());
         
         // Child SA
-        SAPayload child_sa = SAPayload::createChildSAProposal(sa->getFirstChildSA()->getOutboundSPI());
+        SAPayload child_sa = SAPayload::createChildSAProposal(sa->getFirstChildSA()->getInboundSPI());
         std::vector<uint8_t> child_sa_serial = child_sa.serialize(PayloadType::TSi);
         inner_plain.insert(inner_plain.end(), child_sa_serial.begin(), child_sa_serial.end());
         
@@ -663,7 +663,7 @@ private:
         inner_plain.insert(inner_plain.end(), auth_serial.begin(), auth_serial.end());
         
         // Child SA
-        SAPayload chosen_sa = SAPayload::createChildSAProposal(sa->getFirstChildSA()->getOutboundSPI());
+        SAPayload chosen_sa = SAPayload::createChildSAProposal(sa->getFirstChildSA()->getInboundSPI());
         std::vector<uint8_t> sa_serial = chosen_sa.serialize();
         if (!sa_serial.empty()) sa_serial[0] = static_cast<uint8_t>(PayloadType::TSi);
         inner_plain.insert(inner_plain.end(), sa_serial.begin(), sa_serial.end());
@@ -738,7 +738,7 @@ private:
         // Parse SA
         if (inner_hdr.next_payload == PayloadType::SA) {
             SAPayload sa_payload = SAPayload::deserialize(decrypted_inner, inner_off);
-            sa->getFirstChildSA()->setSpiInbound(net_to_host32(*reinterpret_cast<const uint32_t*>(sa_payload.getProposals()[0].spi.data())));
+            sa->getFirstChildSA()->setSpiOutbound(net_to_host32(*reinterpret_cast<const uint32_t*>(sa_payload.getProposals()[0].spi.data())));
             std::cout << "[Responder] Got Child SA payload" << std::endl;
             sa_payload.debugPrint();
             inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);
@@ -794,7 +794,7 @@ private:
         // Parse SA
         if (inner_hdr.next_payload == PayloadType::SA) {
             SAPayload sa_payload = SAPayload::deserialize(decrypted_inner, inner_off);
-            sa->getFirstChildSA()->setSpiInbound(net_to_host32(*reinterpret_cast<const uint32_t*>(sa_payload.getProposals()[0].spi.data())));
+            sa->getFirstChildSA()->setSpiOutbound(net_to_host32(*reinterpret_cast<const uint32_t*>(sa_payload.getProposals()[0].spi.data())));
             std::cout << "[Initiator] Got Child SA payload" << std::endl;
             sa_payload.debugPrint();
             inner_hdr = PayloadHeader::deserialize(decrypted_inner, inner_off);

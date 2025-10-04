@@ -31,10 +31,10 @@ public:
     }
     
     void generateSPIs() {
-        CHECK_OPENSSL(RAND_bytes(reinterpret_cast<uint8_t*>(&spi_inbound), sizeof(spi_inbound)) == 1);
+        CHECK_OPENSSL(RAND_bytes(reinterpret_cast<uint8_t*>(&spi_outbound), sizeof(spi_outbound)) == 1);
     }
-    void setSpiOutbound(uint32_t spi_outbound) {
-        this->spi_outbound = spi_outbound;
+    void setSpiInbound(uint32_t spi_inbound) {
+        this->spi_inbound = spi_inbound;
     }
     void deriveKeys(const std::vector<uint8_t>& sk_d, 
                    const std::vector<uint8_t>& ni, 
