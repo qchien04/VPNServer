@@ -29,8 +29,8 @@
 #include <sys/ioctl.h>
 //g++ -std=c++14 -O2 -Wall -Wextra -o main2 main2.cpp -lssl -lcrypto -lpthread
 // sudo ./main2 responder 8080 MySecretPSK123
-// sudo ./main2 initiator 192.168.1.6 8080 8081 MySecretPSK123
-// scp /home/chien/vpn/main2 chien@192.168.1.19:/home/chien/
+// sudo ./main2 initiator 192.168.2.36 8080 8081 MySecretPSK123
+// scp /home/chien/vpn/main2 chien@192.168.2.38:/home/chien/
 // scp /home/chien/vpn/main2 chien@172.31.213.48:/home/chien/
 // sudo ./main2 initiator 172.31.213.79 8080 8081 MySecretPSK123
 // 172.31.213.79
@@ -1800,6 +1800,37 @@ public:
         return true;
     }
 
+    void cleanupNetworkConfig() {
+        std::string tun_name="tun1";
+        if (tun_name.empty()) return;
+        
+        std::cout << "Cleaning up network configuration..." << std::endl;
+        
+        // 1. Xóa routes
+        if (is_server) {
+            system(("ip route del 10.0.0.0/24 dev " + tun_name + " 2>/dev/null").c_str());
+        } else {
+            system(("ip route del 192.168.50.0/24 via 10.0.0.1 dev " + tun_name + " 2>/dev/null").c_str());
+        }
+        
+        // 2. Xóa iptables rules
+        if (is_server) {
+            std::string lan_interface = "ens37";
+            system(("iptables -t nat -D POSTROUTING -s 10.0.0.0/24 -d 192.168.50.0/24 -o " + 
+                    lan_interface + " -j MASQUERADE 2>/dev/null").c_str());
+            system("iptables -D FORWARD -s 10.0.0.0/24 -d 192.168.50.0/24 -j ACCEPT 2>/dev/null");
+            system("iptables -D FORWARD -s 192.168.50.0/24 -d 10.0.0.0/24 -j ACCEPT 2>/dev/null");
+        }
+        
+        // 3. Tắt interface
+        system(("ip link set " + tun_name + " down 2>/dev/null").c_str());
+        
+        // 4. Xóa IP address
+        system(("ip addr flush dev " + tun_name + " 2>/dev/null").c_str());
+        
+        std::cout << "Network cleanup completed" << std::endl;
+    }
+
     bool initialize(const std::string& local_addr, uint16_t local_p) {
         if (!createTunInterface()) {
             std::cerr << "Failed to create TUN interface" << std::endl;
@@ -2484,7 +2515,7 @@ public:
             inet_ntop(AF_INET, &dst_ip, dst_ip_str, INET_ADDRSTRLEN);
 
             // ---- In ra thông tin ----
-            std::cout << "####-------------------------------" << std::endl;
+            std::cout << "####From read Tun-------------------------------" << std::endl;
             std::cout << "Source IP   : " << src_ip_str << std::endl;
             std::cout << "Destination : " << dst_ip_str << std::endl;
             std::cout << "Protocol    : " << static_cast<int>(protocol) << std::endl;
@@ -2786,12 +2817,13 @@ int main(int argc, char* argv[]) {
                 responder.printSAInfo();
                 
                 vpn = std::make_unique<ESPVPNServer>();
+                vpn->cleanupNetworkConfig();
                 if (!vpn->initialize("0.0.0.0", 4500)) {
                     std::cerr << "Failed to init ESP server\n";
                     return 1;
                 }
 
-                std::string client_ip="192.168.1.19";
+                std::string client_ip="192.168.2.38";
                 // std::cout << "Enter client IP: ";
                 // std::cin >> client_ip;
 
@@ -2844,6 +2876,7 @@ int main(int argc, char* argv[]) {
 
                 auto client = std::make_unique<ESPVPNClient>();
                 vpn = std::move(client);
+                vpn->cleanupNetworkConfig();
 
                 if (!vpn->initialize("0.0.0.0", 8082)) {
                     std::cerr << "Failed to init ESP client\n";
